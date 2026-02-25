@@ -103,8 +103,133 @@ def injetar_arquivos_no_prompt(prompt: str) -> str:
 # ============================================================
 # ASSINATURAS
 # ============================================================
-ASSINATURA_PREFIX = "assinatura:"
-CONSULTA_PREFIX   = "consulta:"
+ASSINATURA_PREFIX  = "assinatura:"
+CONSULTA_PREFIX    = "consulta:"
+AGENDAMENTO_PREFIX = "agendamento:"
+BLOQUEIO_PREFIX    = "bloqueio:"
+CONFIG_AGENDA_KEY  = "config:agenda"
+
+VALOR_CONSULTA     = 350.00
+DURACAO_CONSULTA   = 45  # minutos
+
+HORARIOS_PADRAO = ["08:00","09:00","10:00","11:00","14:00","15:00","16:00","17:00","18:00"]
+DIAS_SEMANA_UTEIS = [0,1,2,3,4]  # segunda a sexta
+
+# ============================================================
+# AGENDA — configuracao
+# ============================================================
+
+def obter_config_agenda() -> dict:
+    dados = r.get(CONFIG_AGENDA_KEY)
+    if not dados:
+        return {"horarios": HORARIOS_PADRAO, "dias_uteis": DIAS_SEMANA_UTEIS, "valor": VALOR_CONSULTA}
+    return json.loads(dados)
+
+def salvar_config_agenda(config: dict):
+    r.set(CONFIG_AGENDA_KEY, json.dumps(config))
+
+# ============================================================
+# AGENDA — agendamentos
+# ============================================================
+
+def criar_agendamento_id(data: str, hora: str) -> str:
+    """Gera chave unica: data_hora ex: 2026-03-10_14:00"""
+    return f"{data}_{hora}"
+
+def obter_agendamento(ag_id: str) -> dict | None:
+    dados = r.get(f"{AGENDAMENTO_PREFIX}{ag_id}")
+    return json.loads(dados) if dados else None
+
+def salvar_agendamento(ag: dict):
+    ag_id = criar_agendamento_id(ag["data"], ag["hora"])
+    r.set(f"{AGENDAMENTO_PREFIX}{ag_id}", json.dumps(ag))
+
+def cancelar_agendamento(ag_id: str):
+    dados = r.get(f"{AGENDAMENTO_PREFIX}{ag_id}")
+    if dados:
+        ag = json.loads(dados)
+        ag["status"] = "cancelado"
+        r.set(f"{AGENDAMENTO_PREFIX}{ag_id}", json.dumps(ag))
+
+def apagar_agendamento(ag_id: str):
+    r.delete(f"{AGENDAMENTO_PREFIX}{ag_id}")
+
+def listar_agendamentos(apenas_futuros: bool = False) -> list:
+    chaves = r.keys(f"{AGENDAMENTO_PREFIX}*")
+    resultado = []
+    hoje = datetime.now().date()
+    for chave in sorted(chaves):
+        dados = json.loads(r.get(chave) or "{}")
+        if apenas_futuros:
+            try:
+                data_ag = datetime.strptime(dados.get("data",""), "%Y-%m-%d").date()
+                if data_ag < hoje:
+                    continue
+            except Exception:
+                pass
+        resultado.append(dados)
+    return sorted(resultado, key=lambda x: (x.get("data",""), x.get("hora","")))
+
+def horario_disponivel(data: str, hora: str) -> bool:
+    """Verifica se horario esta livre (sem agendamento confirmado e sem bloqueio)."""
+    ag_id = criar_agendamento_id(data, hora)
+    ag = obter_agendamento(ag_id)
+    if ag and ag.get("status") in ("confirmado", "pendente"):
+        return False
+    if r.get(f"{BLOQUEIO_PREFIX}{data}_{hora}"):
+        return False
+    if r.get(f"{BLOQUEIO_PREFIX}{data}_dia"):
+        return False
+    return True
+
+def bloquear_horario(data: str, hora: str):
+    r.set(f"{BLOQUEIO_PREFIX}{data}_{hora}", "1")
+
+def desbloquear_horario(data: str, hora: str):
+    r.delete(f"{BLOQUEIO_PREFIX}{data}_{hora}")
+
+def bloquear_dia(data: str):
+    r.set(f"{BLOQUEIO_PREFIX}{data}_dia", "1")
+
+def desbloquear_dia(data: str):
+    r.delete(f"{BLOQUEIO_PREFIX}{data}_dia")
+
+def eh_dia_bloqueado(data: str) -> bool:
+    return bool(r.get(f"{BLOQUEIO_PREFIX}{data}_dia"))
+
+def obter_slots_disponiveis(data: str) -> list:
+    """Retorna lista de horarios disponiveis para uma data."""
+    config = obter_config_agenda()
+    horarios = config.get("horarios", HORARIOS_PADRAO)
+    try:
+        dt = datetime.strptime(data, "%Y-%m-%d")
+        if dt.weekday() not in config.get("dias_uteis", DIAS_SEMANA_UTEIS):
+            return []
+        if dt.date() < datetime.now().date():
+            return []
+    except Exception:
+        return []
+    if eh_dia_bloqueado(data):
+        return []
+    return [h for h in horarios if horario_disponivel(data, h)]
+
+def gerar_proximas_datas(dias: int = 30) -> list:
+    """Gera lista de datas com slots disponíveis nos proximos N dias."""
+    config = obter_config_agenda()
+    dias_uteis = config.get("dias_uteis", DIAS_SEMANA_UTEIS)
+    resultado = []
+    hoje = datetime.now().date()
+    for i in range(1, dias + 1):
+        data = hoje + timedelta(days=i)
+        if data.weekday() not in dias_uteis:
+            continue
+        data_str = data.strftime("%Y-%m-%d")
+        slots = obter_slots_disponiveis(data_str)
+        if slots:
+            resultado.append({"data": data_str, "slots": slots,
+                              "dia_semana": ["Seg","Ter","Qua","Qui","Sex","Sab","Dom"][data.weekday()],
+                              "data_br": data.strftime("%d/%m/%Y")})
+    return resultado
 
 def obter_assinatura(telefone: str) -> dict:
     dados = r.get(f"{ASSINATURA_PREFIX}{telefone}")
@@ -329,6 +454,7 @@ def base_html(titulo: str, conteudo: str, pagina_ativa: str = "") -> str:
     nav = {
         "usuarios":    ("Usuarios",    "/admin"),
         "assinaturas": ("Assinaturas", "/admin/assinaturas"),
+        "agenda":      ("Agenda",      "/admin/agenda"),
         "consultas":   ("Consultas",   "/admin/consultas"),
         "prompt":      ("Prompt",      "/admin/prompt"),
         "arquivos":    ("Arquivos",    "/admin/arquivos"),
@@ -490,7 +616,6 @@ async def pagina_pagamento(ref: str = ""):
 async def pagamento_obrigado(external_reference: str = "", collection_status: str = ""):
     """Pagina de retorno apos pagamento no MP."""
     if collection_status == "approved" and external_reference:
-        # Ativa o usuario imediatamente via retorno
         dados = {
             "telefone": external_reference,
             "status": "ativo",
@@ -524,6 +649,511 @@ async def pagamento_obrigado(external_reference: str = "", collection_status: st
     </div>
 </body>
 </html>""")
+
+
+# ============================================================
+# PAGINA PUBLICA — AGENDAMENTO DE CONSULTA
+# ============================================================
+
+@app.get("/consulta", response_class=HTMLResponse)
+async def pagina_consulta(tel: str = ""):
+    """Pagina publica de agendamento de teleconsulta."""
+    config   = obter_config_agenda()
+    valor    = config.get("valor", VALOR_CONSULTA)
+    datas    = gerar_proximas_datas(30)
+
+    # Monta o calendario HTML
+    cards_datas = ""
+    for d in datas[:14]:  # exibe ate 14 dias
+        slots_html = ""
+        for slot in d["slots"]:
+            ag_id_enc = f"{d['data']}|{slot}|{tel}"
+            slots_html += f"""
+            <button class="slot" onclick="selecionarSlot('{d['data']}', '{slot}', '{d['data_br']}')">{slot}</button>"""
+        cards_datas += f"""
+        <div class="dia-card">
+            <div class="dia-header"><span class="dia-semana">{d['dia_semana']}</span><span class="dia-num">{d['data_br']}</span></div>
+            <div class="slots">{slots_html}</div>
+        </div>"""
+
+    if not cards_datas:
+        cards_datas = "<p style='color:#888;padding:20px;text-align:center'>Nenhum horario disponivel no momento. Entre em contato pelo WhatsApp.</p>"
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agendar Teleconsulta — Dra. Larissa</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: 'Georgia', serif; background: #fafaf8; color: #2d2d2d; }}
+        .hero {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: white; padding: 48px 24px; text-align: center; }}
+        .hero .tag {{ display: inline-block; background: rgba(255,255,255,0.15); border-radius: 20px; padding: 4px 16px; font-size: 13px; margin-bottom: 16px; letter-spacing: 1px; }}
+        .hero h1 {{ font-size: 28px; margin-bottom: 12px; font-weight: normal; }}
+        .hero p {{ font-size: 15px; opacity: 0.85; max-width: 500px; margin: 0 auto; line-height: 1.7; }}
+        .info-bar {{ display: flex; justify-content: center; gap: 32px; background: white; padding: 20px; border-bottom: 1px solid #eee; flex-wrap: wrap; }}
+        .info-item {{ text-align: center; }}
+        .info-item .val {{ font-size: 20px; font-weight: bold; color: #1a1a2e; }}
+        .info-item .lab {{ font-size: 12px; color: #888; margin-top: 2px; }}
+        .container {{ max-width: 780px; margin: 32px auto; padding: 0 20px; }}
+        h2 {{ font-size: 18px; font-weight: normal; color: #444; margin-bottom: 20px; }}
+        .calendario {{ display: flex; gap: 12px; overflow-x: auto; padding-bottom: 12px; }}
+        .dia-card {{ min-width: 120px; background: white; border-radius: 12px; padding: 14px 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
+        .dia-header {{ text-align: center; margin-bottom: 10px; border-bottom: 1px solid #f0f0f0; padding-bottom: 8px; }}
+        .dia-semana {{ display: block; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 1px; }}
+        .dia-num {{ display: block; font-size: 13px; color: #333; margin-top: 2px; }}
+        .slots {{ display: flex; flex-direction: column; gap: 6px; }}
+        .slot {{ background: #f0f4ff; color: #4f46e5; border: none; border-radius: 8px; padding: 8px; font-size: 13px; cursor: pointer; transition: all 0.15s; }}
+        .slot:hover {{ background: #4f46e5; color: white; }}
+        .slot.selecionado {{ background: #4f46e5; color: white; }}
+        .confirmacao {{ display: none; background: white; border-radius: 16px; padding: 28px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); margin-top: 24px; }}
+        .confirmacao h3 {{ margin-bottom: 16px; color: #1a1a2e; }}
+        .resumo {{ background: #f8f9ff; border-radius: 10px; padding: 16px; margin-bottom: 20px; }}
+        .resumo-linha {{ display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; border-bottom: 1px solid #eee; }}
+        .resumo-linha:last-child {{ border: none; font-weight: bold; color: #4f46e5; font-size: 16px; }}
+        input[type=text], input[type=tel] {{ width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; margin-bottom: 12px; font-family: Arial, sans-serif; }}
+        input:focus {{ outline: none; border-color: #4f46e5; box-shadow: 0 0 0 2px rgba(79,70,229,0.1); }}
+        .btn-pagar {{ display: block; width: 100%; background: #4f46e5; color: white; padding: 16px; border-radius: 10px; font-size: 16px; font-weight: bold; border: none; cursor: pointer; margin-top: 8px; }}
+        .btn-pagar:hover {{ background: #4338ca; }}
+        .seguro {{ font-size: 12px; color: #aaa; text-align: center; margin-top: 12px; }}
+        .sobre {{ background: white; border-radius: 16px; padding: 28px; margin-top: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }}
+        .sobre h3 {{ color: #1a1a2e; margin-bottom: 12px; font-size: 16px; }}
+        .sobre ul {{ list-style: none; padding: 0; }}
+        .sobre ul li {{ padding: 6px 0; font-size: 14px; color: #555; }}
+        .sobre ul li::before {{ content: "✓ "; color: #16a34a; font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <div class="hero">
+        <div class="tag">🧠 TELECONSULTA ONLINE</div>
+        <h1>Dra. Larissa Alves Lourenco</h1>
+        <p>Psiquiatra Infantil especializada em TDAH, TEA e desenvolvimento. CRM SP 223841</p>
+    </div>
+    <div class="info-bar">
+        <div class="info-item"><div class="val">45 min</div><div class="lab">Duracao</div></div>
+        <div class="info-item"><div class="val">Online</div><div class="lab">Modalidade</div></div>
+        <div class="info-item"><div class="val">Individual</div><div class="lab">Formato</div></div>
+        <div class="info-item"><div class="val">R$ {valor:.2f}</div><div class="lab">Valor</div></div>
+    </div>
+    <div class="container">
+        <h2>Escolha um horario disponivel:</h2>
+        <div class="calendario">
+            {cards_datas}
+        </div>
+
+        <div class="confirmacao" id="confirmacao">
+            <h3>Confirmar agendamento</h3>
+            <div class="resumo">
+                <div class="resumo-linha"><span>Consulta</span><span>Teleconsulta individual</span></div>
+                <div class="resumo-linha"><span>Data</span><span id="res-data">—</span></div>
+                <div class="resumo-linha"><span>Horario</span><span id="res-hora">—</span></div>
+                <div class="resumo-linha"><span>Duracao</span><span>{DURACAO_CONSULTA} minutos</span></div>
+                <div class="resumo-linha"><span>Total</span><span>R$ {valor:.2f}</span></div>
+            </div>
+            <input type="text" id="nome" placeholder="Seu nome completo" required>
+            <input type="tel" id="telefone" placeholder="WhatsApp (com DDD, ex: 11999998888)" value="{tel}">
+            <button class="btn-pagar" onclick="irParaPagamento()">Pagar e confirmar agendamento</button>
+            <p class="seguro">🔒 Pagamento seguro via Mercado Pago</p>
+        </div>
+
+        <div class="sobre">
+            <h3>O que voce pode esperar da consulta:</h3>
+            <ul>
+                <li>Avaliacao comportamental e orientacao especializada</li>
+                <li>Discussao sobre sinais de TDAH, TEA ou outros transtornos</li>
+                <li>Estrategias praticas para o dia a dia em familia</li>
+                <li>Orientacao sobre quando e como buscar avaliacao presencial</li>
+                <li>Link de videoconferencia enviado por WhatsApp apos pagamento</li>
+            </ul>
+        </div>
+    </div>
+    <script>
+        let dataSelecionada = "", horaSelecionada = "", dataBR = "";
+
+        function selecionarSlot(data, hora, dataBrStr) {{
+            document.querySelectorAll('.slot').forEach(b => b.classList.remove('selecionado'));
+            event.target.classList.add('selecionado');
+            dataSelecionada = data;
+            horaSelecionada = hora;
+            dataBR = dataBrStr;
+            document.getElementById('res-data').textContent = dataBrStr;
+            document.getElementById('res-hora').textContent = hora;
+            document.getElementById('confirmacao').style.display = 'block';
+            document.getElementById('confirmacao').scrollIntoView({{behavior:'smooth'}});
+        }}
+
+        function irParaPagamento() {{
+            const nome = document.getElementById('nome').value.trim();
+            const tel  = document.getElementById('telefone').value.trim();
+            if (!nome) {{ alert('Por favor, informe seu nome.'); return; }}
+            if (!tel)  {{ alert('Por favor, informe seu WhatsApp.'); return; }}
+            if (!dataSelecionada) {{ alert('Selecione um horario.'); return; }}
+            const ref = encodeURIComponent(dataSelecionada + '|' + horaSelecionada + '|' + tel + '|' + nome);
+            window.location.href = '/consulta/checkout?ref=' + ref;
+        }}
+    </script>
+</body>
+</html>""")
+
+
+@app.get("/consulta/checkout")
+async def consulta_checkout(ref: str = ""):
+    """Cria preferencia de pagamento MP e redireciona."""
+    if not ref or not MP_ACCESS_TOKEN:
+        return RedirectResponse(url="/consulta")
+
+    try:
+        partes = ref.split("|")
+        data   = partes[0] if len(partes) > 0 else ""
+        hora   = partes[1] if len(partes) > 1 else ""
+        tel    = partes[2] if len(partes) > 2 else ""
+        nome   = partes[3] if len(partes) > 3 else "Paciente"
+    except Exception:
+        return RedirectResponse(url="/consulta")
+
+    # Verifica disponibilidade antes de cobrar
+    if not horario_disponivel(data, hora):
+        return HTMLResponse("<h2 style='font-family:Arial;padding:40px;text-align:center'>Ops! Este horario foi ocupado. <a href='/consulta'>Escolha outro</a></h2>")
+
+    # Reserva o slot temporariamente
+    ag_id = criar_agendamento_id(data, hora)
+    ag_temp = {
+        "id": ag_id,
+        "data": data,
+        "hora": hora,
+        "telefone": tel,
+        "nome": nome,
+        "status": "pendente",
+        "criado_em": datetime.now().isoformat()
+    }
+    salvar_agendamento(ag_temp)
+
+    config = obter_config_agenda()
+    valor  = config.get("valor", VALOR_CONSULTA)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            res = await http.post(
+                "https://api.mercadopago.com/checkout/preferences",
+                headers={
+                    "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "items": [{
+                        "title": f"Teleconsulta Dra. Larissa — {data} as {hora}",
+                        "quantity": 1,
+                        "unit_price": float(valor),
+                        "currency_id": "BRL"
+                    }],
+                    "payer": {"name": nome},
+                    "external_reference": ref,
+                    "back_urls": {
+                        "success": f"{BASE_URL}/consulta/obrigado",
+                        "failure": f"{BASE_URL}/consulta",
+                        "pending": f"{BASE_URL}/consulta/obrigado"
+                    },
+                    "auto_return": "approved",
+                    "notification_url": f"{BASE_URL}/webhook/mercadopago"
+                }
+            )
+            dados_mp = res.json()
+            link_mp  = dados_mp.get("init_point", "")
+            if link_mp:
+                return RedirectResponse(url=link_mp)
+    except Exception as e:
+        print(f"ERRO ao criar preferencia MP: {e}")
+
+    return HTMLResponse("<h2 style='font-family:Arial;padding:40px;text-align:center'>Erro ao iniciar pagamento. <a href='/consulta'>Tente novamente</a></h2>")
+
+
+@app.get("/consulta/obrigado", response_class=HTMLResponse)
+async def consulta_obrigado(external_reference: str = "", collection_status: str = "", payment_id: str = ""):
+    """Retorno apos pagamento da consulta."""
+    if collection_status == "approved" and external_reference:
+        try:
+            partes = external_reference.split("|")
+            data   = partes[0]
+            hora   = partes[1]
+            tel    = partes[2]
+            nome   = partes[3] if len(partes) > 3 else "Paciente"
+
+            ag_id = criar_agendamento_id(data, hora)
+            ag = obter_agendamento(ag_id) or {}
+            ag.update({
+                "id": ag_id, "data": data, "hora": hora,
+                "telefone": tel, "nome": nome,
+                "status": "confirmado",
+                "payment_id": payment_id,
+                "confirmado_em": datetime.now().isoformat()
+            })
+            salvar_agendamento(ag)
+
+            data_br = datetime.strptime(data, "%Y-%m-%d").strftime("%d/%m/%Y")
+            await enviar_whatsapp(tel,
+                f"Consulta confirmada! 🎉\n\n"
+                f"📅 Data: {data_br}\n"
+                f"🕐 Horario: {hora}\n"
+                f"⏱ Duracao: {DURACAO_CONSULTA} minutos\n"
+                f"💻 Formato: Teleconsulta online\n\n"
+                f"O link de videoconferencia sera enviado aqui no WhatsApp 30 minutos antes da consulta.\n\n"
+                f"Qualquer duvida, e so me chamar aqui! 💙")
+        except Exception as e:
+            print(f"ERRO ao confirmar consulta: {e}")
+
+    return HTMLResponse("""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <title>Consulta confirmada!</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f0fdf4; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+        .card { background: white; border-radius: 16px; padding: 40px; max-width: 420px; text-align: center; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+        .emoji { font-size: 56px; margin-bottom: 16px; }
+        h1 { color: #16a34a; margin-bottom: 12px; font-size: 22px; }
+        p { color: #555; line-height: 1.7; font-size: 15px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="emoji">🎉</div>
+        <h1>Consulta confirmada!</h1>
+        <p>O pagamento foi aprovado e sua consulta esta agendada.<br><br>
+        Voce recebera uma mensagem no WhatsApp com todos os detalhes e o link da videoconferencia.</p>
+    </div>
+</body>
+</html>""")
+
+
+# ============================================================
+# PAINEL ADMIN — AGENDA
+# ============================================================
+
+@app.get("/admin/agenda", response_class=HTMLResponse)
+def painel_agenda(admin: str = Depends(verificar_admin), msg: str = ""):
+    agendamentos = listar_agendamentos(apenas_futuros=False)
+    config       = obter_config_agenda()
+    aviso = f'<div class="success">{msg}</div>' if msg else ""
+
+    futuros    = [a for a in agendamentos if a.get("status") == "confirmado" and a.get("data","") >= datetime.now().strftime("%Y-%m-%d")]
+    pendentes  = [a for a in agendamentos if a.get("status") == "pendente"]
+    passados   = [a for a in agendamentos if a.get("status") == "confirmado" and a.get("data","") < datetime.now().strftime("%Y-%m-%d")]
+    cancelados = [a for a in agendamentos if a.get("status") == "cancelado"]
+
+    def render_ag(lista, mostrar_acoes=True):
+        if not lista:
+            return "<p style='color:#888;padding:12px 0'>Nenhum.</p>"
+        rows = ""
+        for ag in lista:
+            tel  = ag.get("telefone","—")
+            nome = ag.get("nome","—")
+            data = ag.get("data","")
+            hora = ag.get("hora","—")
+            ag_id = criar_agendamento_id(data, hora)
+            try:
+                data_br = datetime.strptime(data, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                data_br = data
+            status = ag.get("status","—")
+            badge_cor = {"confirmado":"badge-ativo","pendente":"badge-pendente","cancelado":"badge-inativo"}.get(status,"")
+            acoes = ""
+            if mostrar_acoes:
+                acoes = f'<a href="/admin/agenda/cancelar/{ag_id}" onclick="return confirm(\'Cancelar este agendamento?\')" class="btn btn-warning" style="margin-right:6px">Cancelar</a>'
+                acoes += f'<a href="/admin/agenda/apagar/{ag_id}" onclick="return confirm(\'Apagar permanentemente?\')" class="btn btn-danger">Apagar</a>'
+            rows += f"""
+            <div class="aluno-row">
+                <div>
+                    <div><strong>{nome}</strong> <span class="badge {badge_cor}">{status}</span></div>
+                    <div class="aluno-info">📅 {data_br} as {hora} | 📱 {tel}</div>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">{acoes}</div>
+            </div>"""
+        return rows
+
+    # Bloqueios ativos
+    bloqueios_chaves = r.keys(f"{BLOQUEIO_PREFIX}*")
+    bloqueios_html = ""
+    for chave in sorted(bloqueios_chaves):
+        bl = chave.replace(BLOQUEIO_PREFIX, "")
+        bloqueios_html += f"""
+        <div class="aluno-row">
+            <div><div>{bl.replace('_dia',' — DIA INTEIRO').replace('_',' as ')}</div></div>
+            <a href="/admin/agenda/desbloquear/{bl}" class="btn btn-success">Desbloquear</a>
+        </div>"""
+    if not bloqueios_html:
+        bloqueios_html = "<p style='color:#888;padding:12px 0'>Nenhum bloqueio ativo.</p>"
+
+    horarios_check = ""
+    for h in ["08:00","09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00","20:00"]:
+        checked = "checked" if h in config.get("horarios", HORARIOS_PADRAO) else ""
+        horarios_check += f'<label style="margin-right:12px;font-size:14px"><input type="checkbox" name="horarios" value="{h}" {checked}> {h}</label>'
+
+    conteudo = f"""
+    {aviso}
+    <div class="stats">
+        <div class="stat"><div class="num">{len(futuros)}</div><div class="label">Proximas</div></div>
+        <div class="stat"><div class="num">{len(pendentes)}</div><div class="label">Pendentes</div></div>
+        <div class="stat"><div class="num">{len(passados)}</div><div class="label">Realizadas</div></div>
+    </div>
+
+    <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+            <h2>Proximas consultas ({len(futuros)})</h2>
+            <a href="/admin/agenda/nova" class="btn btn-primary">+ Novo agendamento</a>
+        </div>
+        {render_ag(futuros)}
+    </div>
+
+    <div class="card">
+        <h2>Pendentes de pagamento ({len(pendentes)})</h2>
+        {render_ag(pendentes)}
+    </div>
+
+    <div class="card">
+        <h2>Bloquear data ou horario</h2>
+        <form method="post" action="/admin/agenda/bloquear" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+            <div>
+                <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">Data</label>
+                <input type="date" name="data" required style="padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px">
+            </div>
+            <div>
+                <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">Horario (vazio = dia inteiro)</label>
+                <input type="text" name="hora" placeholder="ex: 14:00" style="width:130px;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px">
+            </div>
+            <button type="submit" class="btn btn-warning">Bloquear</button>
+        </form>
+        <div style="margin-top:16px">{bloqueios_html}</div>
+    </div>
+
+    <div class="card">
+        <h2>Configurar horarios disponiveis</h2>
+        <form method="post" action="/admin/agenda/config">
+            <div style="margin-bottom:16px;line-height:2.2">{horarios_check}</div>
+            <div style="margin-bottom:12px">
+                <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">Valor da consulta (R$)</label>
+                <input type="number" name="valor" value="{config.get('valor', VALOR_CONSULTA)}" step="0.01" style="width:160px;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px">
+            </div>
+            <button type="submit" class="btn btn-primary">Salvar configuracoes</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Consultas realizadas ({len(passados)})</h2>
+        {render_ag(passados, False)}
+    </div>
+    <div class="card">
+        <h2>Canceladas ({len(cancelados)})</h2>
+        {render_ag(cancelados, False)}
+    </div>"""
+
+    return HTMLResponse(base_html("Agenda", conteudo, "agenda"))
+
+
+@app.get("/admin/agenda/nova", response_class=HTMLResponse)
+def novo_agendamento_get(admin: str = Depends(verificar_admin)):
+    conteudo = """
+    <a class="back" href="/admin/agenda">← Voltar</a>
+    <div class="card">
+        <h2>Novo agendamento manual</h2>
+        <form method="post" action="/admin/agenda/nova">
+            <div style="margin-bottom:12px">
+                <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">Nome do paciente</label>
+                <input type="text" name="nome" required placeholder="Maria Silva">
+            </div>
+            <div style="margin-bottom:12px">
+                <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">WhatsApp (com DDD)</label>
+                <input type="text" name="telefone" required placeholder="5511999998888">
+            </div>
+            <div style="margin-bottom:12px;display:flex;gap:12px">
+                <div style="flex:1">
+                    <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">Data</label>
+                    <input type="date" name="data" required style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px">
+                </div>
+                <div style="flex:1">
+                    <label style="font-size:13px;color:#555;display:block;margin-bottom:4px">Horario</label>
+                    <input type="text" name="hora" required placeholder="14:00" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">Criar agendamento</button>
+        </form>
+    </div>"""
+    return HTMLResponse(base_html("Novo Agendamento", conteudo, "agenda"))
+
+
+@app.post("/admin/agenda/nova")
+async def novo_agendamento_post(
+    nome: str = Form(...),
+    telefone: str = Form(...),
+    data: str = Form(...),
+    hora: str = Form(...),
+    admin: str = Depends(verificar_admin)
+):
+    ag_id = criar_agendamento_id(data, hora)
+    ag = {
+        "id": ag_id, "data": data, "hora": hora,
+        "telefone": telefone, "nome": nome,
+        "status": "confirmado",
+        "origem": "manual",
+        "criado_em": datetime.now().isoformat()
+    }
+    salvar_agendamento(ag)
+    return RedirectResponse(url="/admin/agenda?msg=Agendamento+criado!", status_code=303)
+
+
+@app.get("/admin/agenda/cancelar/{ag_id:path}")
+async def cancelar_ag(ag_id: str, admin: str = Depends(verificar_admin)):
+    ag = obter_agendamento(ag_id)
+    if ag:
+        cancelar_agendamento(ag_id)
+        tel = ag.get("telefone","")
+        if tel:
+            data_br = datetime.strptime(ag.get("data",""), "%Y-%m-%d").strftime("%d/%m/%Y") if ag.get("data") else ""
+            await enviar_whatsapp(tel,
+                f"Sua consulta do dia {data_br} as {ag.get('hora','')} foi cancelada.\n\nSe quiser reagendar, acesse: {BASE_URL}/consulta ou nos chame aqui pelo WhatsApp.")
+    return RedirectResponse(url="/admin/agenda?msg=Agendamento+cancelado!")
+
+
+@app.get("/admin/agenda/apagar/{ag_id:path}")
+def apagar_ag(ag_id: str, admin: str = Depends(verificar_admin)):
+    apagar_agendamento(ag_id)
+    return RedirectResponse(url="/admin/agenda?msg=Agendamento+apagado!")
+
+
+@app.post("/admin/agenda/bloquear")
+async def bloquear_rota(
+    data: str = Form(...),
+    hora: str = Form(""),
+    admin: str = Depends(verificar_admin)
+):
+    if hora.strip():
+        bloquear_horario(data, hora.strip())
+        msg = f"Horario+{hora}+em+{data}+bloqueado!"
+    else:
+        bloquear_dia(data)
+        msg = f"Dia+{data}+bloqueado!"
+    return RedirectResponse(url=f"/admin/agenda?msg={msg}", status_code=303)
+
+
+@app.get("/admin/agenda/desbloquear/{chave:path}")
+def desbloquear_rota(chave: str, admin: str = Depends(verificar_admin)):
+    r.delete(f"{BLOQUEIO_PREFIX}{chave}")
+    return RedirectResponse(url="/admin/agenda?msg=Desbloqueado!")
+
+
+@app.post("/admin/agenda/config")
+async def salvar_config_agenda_rota(
+    request: Request,
+    valor: float = Form(VALOR_CONSULTA),
+    admin: str = Depends(verificar_admin)
+):
+    form = await request.form()
+    horarios = form.getlist("horarios")
+    config = obter_config_agenda()
+    config["horarios"] = sorted(horarios)
+    config["valor"]    = valor
+    salvar_config_agenda(config)
+    return RedirectResponse(url="/admin/agenda?msg=Configuracoes+salvas!", status_code=303)
 
 # ============================================================
 # WEBHOOK MERCADO PAGO
