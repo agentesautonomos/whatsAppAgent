@@ -409,6 +409,150 @@ def classificar_nicho(telefone: str, mensagem: str) -> str | None:
 
 
 # ============================================================
+# LEADS (prospeccao) — importacao em lote, botao "Oi" e medicao da demora
+# ============================================================
+from html import escape as esc
+from urllib.parse import quote
+
+LEAD_PREFIX         = "lead:"
+CONTATO_PEND_PREFIX = "contato_pendente:"
+DEMORA_PREFIX       = "demora:"
+OI_TEXTO_KEY        = "config:oi_texto"
+OI_TEXTO_PADRAO     = "Oi! 👋"
+DEMORA_LIMITE_MIN   = float(os.environ.get("DEMORA_LIMITE_MIN", "5"))
+
+
+def obter_oi_texto() -> str:
+    return r.get(OI_TEXTO_KEY) or OI_TEXTO_PADRAO
+
+
+def normalizar_telefone(valor) -> str | None:
+    d = re.sub(r"\D", "", valor or "")
+    if len(d) in (10, 11):
+        d = "55" + d
+    if len(d) < 12 or len(d) > 15:
+        return None
+    return d
+
+
+def variantes_telefone(tel: str) -> set:
+    """O WhatsApp as vezes manda o numero sem o 9 extra. Considera as duas formas."""
+    v = {tel}
+    if tel.startswith("55"):
+        resto = tel[2:]
+        if len(resto) == 10:
+            v.add("55" + resto[:2] + "9" + resto[2:])
+        elif len(resto) == 11 and resto[2] == "9":
+            v.add("55" + resto[:2] + resto[3:])
+    return v
+
+
+def obter_lead(tel: str) -> dict | None:
+    for v in variantes_telefone(tel):
+        dados = r.get(f"{LEAD_PREFIX}{v}")
+        if dados:
+            return json.loads(dados)
+    return None
+
+
+def salvar_lead(lead: dict):
+    r.set(f"{LEAD_PREFIX}{lead['telefone']}", json.dumps(lead))
+
+
+def apagar_lead(tel: str):
+    for v in variantes_telefone(tel):
+        r.delete(f"{LEAD_PREFIX}{v}")
+
+
+def listar_leads() -> list:
+    leads = []
+    for chave in r.keys(f"{LEAD_PREFIX}*"):
+        try:
+            leads.append(json.loads(r.get(chave) or "{}"))
+        except Exception:
+            pass
+    return sorted(leads, key=lambda l: l.get("importado_em", ""))
+
+
+def importar_leads(texto: str) -> dict:
+    """Cada linha: 'numero' ou 'nome numero' (qualquer ordem/separador)."""
+    res = {"importados": 0, "duplicados": 0, "invalidos": 0}
+    for linha in (texto or "").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        m = re.search(r"\+?\(?\d[\d\s().\-]{8,}\d", linha)
+        tel = normalizar_telefone(m.group(0)) if m else None
+        if not tel:
+            res["invalidos"] += 1
+            continue
+        nome = (linha[:m.start()] + " " + linha[m.end():]).strip(" ,;:|-\t()")
+        ja_usuario = any(r.get(f"historico:{v}") for v in variantes_telefone(tel))
+        if obter_lead(tel) or ja_usuario:
+            res["duplicados"] += 1
+            continue
+        salvar_lead({"telefone": tel, "nome": nome[:80], "status": "pendente",
+                     "importado_em": datetime.now().isoformat()})
+        res["importados"] += 1
+    return res
+
+
+def fmt_duracao(seg) -> str:
+    seg = int(seg)
+    if seg < 60:
+        return f"{seg} segundos"
+    minutos = seg // 60
+    if minutos < 60:
+        return f"{minutos} minuto" + ("s" if minutos != 1 else "")
+    horas, resto = divmod(minutos, 60)
+    return f"{horas}h" + (f"{resto:02d}min" if resto else "")
+
+
+def processar_retorno_lead(telefone: str):
+    """Chamada quando chega mensagem: se o numero era um lead, ele vira usuario.
+    Se ja tinha recebido o 'oi', mede a demora da resposta (so no 1o contato)."""
+    lead = obter_lead(telefone)
+    if not lead:
+        return
+    apagar_lead(telefone)
+    if lead.get("status") == "enviado" and lead.get("enviado_em"):
+        try:
+            seg = int((datetime.now() - datetime.fromisoformat(lead["enviado_em"])).total_seconds())
+        except Exception:
+            return
+        r.set(f"{DEMORA_PREFIX}{telefone}", str(seg))
+        r.set(f"{CONTATO_PEND_PREFIX}{telefone}", json.dumps({"demora_seg": seg}))
+
+
+def bloco_primeiro_contato(telefone: str) -> str:
+    dados = r.get(f"{CONTATO_PEND_PREFIX}{telefone}")
+    if not dados:
+        return ""
+    try:
+        seg = int(json.loads(dados).get("demora_seg", 0))
+    except Exception:
+        return ""
+    if seg > DEMORA_LIMITE_MIN * 60:
+        tempo = fmt_duracao(seg)
+        return (
+            "\n\n=== PRIMEIRO CONTATO (VOCE INICIOU A CONVERSA) ===\n"
+            f"Voce, o AgenteLab, mandou um 'oi' primeiro para esta pessoa e ela acabou de responder, {tempo} depois.\n"
+            "Comece sua resposta com UMA frase curta, leve e sem acusar, comentando essa demora e ligando ao dia a dia "
+            "do profissional: quando um cliente dele manda mensagem e demora esse tempo para ser respondido, ele pode "
+            f"procurar outro profissional. Use o tempo exato ({tempo}). Use sempre a palavra 'cliente'.\n"
+            "Em seguida, na mesma mensagem, apresente-se e pergunte a area de atuacao (ETAPA 1). Maximo 5 linhas.\n"
+            "Isso vale SO nesta primeira resposta: depois nao volte a falar da demora.\n"
+            "=== FIM DO PRIMEIRO CONTATO ===\n"
+        )
+    return (
+        "\n\n=== PRIMEIRO CONTATO (VOCE INICIOU A CONVERSA) ===\n"
+        "Voce mandou um 'oi' primeiro para esta pessoa e ela respondeu rapido. "
+        "NAO comente sobre demora. Siga a ETAPA 1 normalmente.\n"
+        "=== FIM DO PRIMEIRO CONTATO ===\n"
+    )
+
+
+# ============================================================
 # PROCESSAMENTO DE MIDIA
 # ============================================================
 
@@ -558,6 +702,7 @@ input[type=text], input[type=number] { width: 100%; padding: 10px; border: 1px s
 def base_html(titulo: str, conteudo: str, pagina_ativa: str = "") -> str:
     nav = {
         "usuarios":    ("Usuarios",    "/admin"),
+        "leads":       ("Leads",       "/admin/leads"),
         "assinaturas": ("Assinaturas", "/admin/assinaturas"),
         "agenda":      ("Agenda",      "/admin/agenda"),
         "consultas":   ("Consultas",   "/admin/consultas"),
@@ -602,9 +747,14 @@ async def enviar_whatsapp(telefone: str, mensagem: str):
     headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": numero_limpo, "message": mensagem}
     print(f"ENVIANDO para {numero_limpo}")
-    async with httpx.AsyncClient(timeout=30) as http:
-        response = await http.post(url, headers=headers, json=payload)
-        print(f"Z-API STATUS: {response.status_code} | {response.text}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            response = await http.post(url, headers=headers, json=payload)
+            print(f"Z-API STATUS: {response.status_code} | {response.text}")
+            return response.status_code < 300
+    except Exception as e:
+        print(f"ERRO ao enviar WhatsApp: {e}")
+        return False
 
 
 def obter_link_pagamento(telefone: str) -> str:
@@ -625,6 +775,8 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
             # Registra com nome desconhecido por enquanto, sera atualizado
             registrar_interesse_consulta(telefone, "Nome nao informado")
             print(f"INTERESSE CONSULTA registrado: {telefone}")
+
+    processar_retorno_lead(telefone)
 
     salvar_mensagem(telefone, "user", mensagem_usuario)
     historico = obter_historico(telefone)
@@ -668,7 +820,8 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
             bloco_nicho = (f"\n\n=== SCRIPT DO NICHO ATUAL ({nicho}) — siga este script ===\n"
                            f"{conteudo_nicho}\n=== FIM DO SCRIPT DO NICHO ===\n")
 
-    system = prompt_base + bloco_nicho + f"\n\nDATA ATUAL: {dia_semana}, {hoje}\nSTATUS DO USUARIO: {status_usuario}\nLINK DE PAGAMENTO: {link_pg}"
+    bloco_contato = bloco_primeiro_contato(telefone)
+    system = prompt_base + bloco_nicho + bloco_contato + f"\n\nDATA ATUAL: {dia_semana}, {hoje}\nSTATUS DO USUARIO: {status_usuario}\nLINK DE PAGAMENTO: {link_pg}"
 
     resposta = client.messages.create(
         model=AGENT_MODEL,
@@ -677,6 +830,7 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
         messages=historico
     )
     registrar_tokens(telefone, resposta.usage)
+    r.delete(f"{CONTATO_PEND_PREFIX}{telefone}")
 
     texto_resposta = resposta.content[0].text
     salvar_mensagem(telefone, "assistant", texto_resposta)
@@ -1442,6 +1596,8 @@ def painel_admin(admin: str = Depends(verificar_admin)):
         ultima    = historico[-1]["content"][:80] + "..." if historico else "—"
         premium   = eh_premium(telefone)
         nicho_badge = nicho_badge_html(obter_nicho(telefone))
+        _dem = r.get(f"{DEMORA_PREFIX}{telefone}")
+        demora_badge = f'<span class="badge badge-pendente">respondeu o oi em {fmt_duracao(_dem)}</span>' if _dem else ""
         tk = obter_tokens(telefone)
         tokens_txt = f"{fmt_tokens(tk['total'])} tokens · {fmt_brl(tk['custo_brl'])} (entrada {fmt_tokens(tk['entrada'])} / saida {fmt_tokens(tk['saida'])})"
         badge     = '<span class="badge badge-premium">Premium</span>' if premium else '<span class="badge badge-freemium">Freemium</span>'
@@ -1452,7 +1608,7 @@ def painel_admin(admin: str = Depends(verificar_admin)):
                     <a href="/admin/conversa/{telefone}">{telefone}</a>
                     {badge}
                     <span class="badge" style="background:#e0e7ff;color:#4f46e5">{total} msgs</span>
-                    {nicho_badge}
+                    {nicho_badge}{demora_badge}
                 </div>
                 <div class="aluno-info">{tokens_txt}</div>
                 <div class="aluno-info">{ultima}</div>
@@ -1526,6 +1682,7 @@ def ver_conversa(telefone: str, admin: str = Depends(verificar_admin)):
 def apagar_historico(telefone: str, admin: str = Depends(verificar_admin)):
     r.delete(f"historico:{telefone}")
     r.delete(f"{NICHO_PREFIX}{telefone}")
+    r.delete(f"{CONTATO_PEND_PREFIX}{telefone}")
     return RedirectResponse(url="/admin")
 
 # ============================================================
@@ -1818,6 +1975,131 @@ async def upload_arquivo(
 def apagar_arquivo_rota(nome: str, admin: str = Depends(verificar_admin)):
     apagar_arquivo(nome)
     return RedirectResponse(url="/admin/arquivos")
+
+# ============================================================
+# PAINEL ADMIN — LEADS
+# ============================================================
+
+def _redir_leads(msg: str = ""):
+    url = "/admin/leads" + (f"?msg={quote(msg)}" if msg else "")
+    return RedirectResponse(url=url, status_code=303)
+
+
+@app.get("/admin/leads", response_class=HTMLResponse)
+def painel_leads(admin: str = Depends(verificar_admin), msg: str = ""):
+    leads     = listar_leads()
+    pendentes = [l for l in leads if l.get("status") != "enviado"]
+    enviados  = sorted([l for l in leads if l.get("status") == "enviado"],
+                       key=lambda l: l.get("enviado_em", ""), reverse=True)
+    aviso = f'<div class="success">{esc(msg)}</div>' if msg else ""
+    agora = datetime.now()
+
+    rows_pend = ""
+    for l in pendentes:
+        tel  = esc(l.get("telefone", ""))
+        nome = esc(l.get("nome") or "(sem nome)")
+        rows_pend += f"""
+        <div class="aluno-row">
+            <div><strong>{nome}</strong> <span class="badge badge-freemium">{tel}</span></div>
+            <div style="display:flex;gap:6px">
+                <form method="post" action="/admin/leads/oi/{tel}"><button type="submit" class="btn btn-primary">👋 Oi</button></form>
+                <form method="post" action="/admin/leads/remover/{tel}" onsubmit="return confirm('Remover este lead?')"><button type="submit" class="btn btn-danger">Remover</button></form>
+            </div>
+        </div>"""
+    if not rows_pend:
+        rows_pend = "<p style='color:#888;padding:12px 0'>Nenhum lead pendente. Importe uma lista acima.</p>"
+
+    rows_env = ""
+    for l in enviados:
+        tel  = esc(l.get("telefone", ""))
+        nome = esc(l.get("nome") or "(sem nome)")
+        try:
+            ha = fmt_duracao((agora - datetime.fromisoformat(l["enviado_em"])).total_seconds())
+        except Exception:
+            ha = "?"
+        rows_env += f"""
+        <div class="aluno-row">
+            <div>
+                <div><strong>{nome}</strong> <span class="badge badge-freemium">{tel}</span> <span class="badge badge-pendente">aguardando resposta</span></div>
+                <div class="aluno-info">oi enviado ha {ha}</div>
+            </div>
+            <form method="post" action="/admin/leads/remover/{tel}" onsubmit="return confirm('Remover este lead?')"><button type="submit" class="btn btn-danger">Remover</button></form>
+        </div>"""
+    if not rows_env:
+        rows_env = "<p style='color:#888;padding:12px 0'>Nenhum oi enviado aguardando resposta.</p>"
+
+    conteudo = f"""
+    {aviso}
+    <div class="stats">
+        <div class="stat"><div class="num">{len(pendentes)}</div><div class="label">Pendentes</div></div>
+        <div class="stat"><div class="num">{len(enviados)}</div><div class="label">Aguardando resposta</div></div>
+    </div>
+
+    <div class="card">
+        <h2>Importar leads</h2>
+        <p style="font-size:13px;color:#888;margin-bottom:12px;">
+            Cole uma lista, um por linha: so o numero, ou nome e numero (ex: <code>Dr Joao 11 99999-8888</code>).
+            Numeros ja importados ou que ja conversaram sao ignorados.
+        </p>
+        <form method="post" action="/admin/leads/importar">
+            <textarea name="texto" style="min-height:130px" placeholder="Dr Joao 11 99999-8888&#10;(51) 98888-7777&#10;5511977776666"></textarea>
+            <br><br>
+            <button type="submit" class="btn btn-primary">Importar</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Mensagem do "Oi"</h2>
+        <form method="post" action="/admin/leads/texto" style="display:flex;gap:10px;align-items:center">
+            <input type="text" name="oi_texto" value="{esc(obter_oi_texto())}">
+            <button type="submit" class="btn btn-primary">Salvar</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Pendentes ({len(pendentes)})</h2>
+        {rows_pend}
+    </div>
+
+    <div class="card">
+        <h2>Oi enviado — aguardando resposta ({len(enviados)})</h2>
+        <p style="font-size:13px;color:#888;margin-bottom:8px;">Quando a pessoa responde, ela sai daqui e aparece em Usuarios.</p>
+        {rows_env}
+    </div>"""
+    return HTMLResponse(base_html("Leads", conteudo, "leads"))
+
+
+@app.post("/admin/leads/importar")
+async def leads_importar(texto: str = Form(""), admin: str = Depends(verificar_admin)):
+    res = importar_leads(texto)
+    return _redir_leads(f"{res['importados']} importados, {res['duplicados']} ja existiam, {res['invalidos']} invalidos")
+
+
+@app.post("/admin/leads/oi/{tel}")
+async def leads_oi(tel: str, admin: str = Depends(verificar_admin)):
+    lead = obter_lead(tel)
+    if not lead or lead.get("status") == "enviado":
+        return _redir_leads("Lead nao encontrado ou o oi ja foi enviado")
+    ok = await enviar_whatsapp(lead["telefone"], obter_oi_texto())
+    if not ok:
+        return _redir_leads("Nao consegui enviar. Confira as variaveis da Z-API no Railway e se o WhatsApp esta conectado.")
+    lead["status"]     = "enviado"
+    lead["enviado_em"] = datetime.now().isoformat()
+    salvar_lead(lead)
+    return _redir_leads(f"Oi enviado para {lead.get('nome') or lead['telefone']}")
+
+
+@app.post("/admin/leads/remover/{tel}")
+async def leads_remover(tel: str, admin: str = Depends(verificar_admin)):
+    apagar_lead(tel)
+    return _redir_leads("Lead removido")
+
+
+@app.post("/admin/leads/texto")
+async def leads_texto(oi_texto: str = Form(""), admin: str = Depends(verificar_admin)):
+    r.set(OI_TEXTO_KEY, oi_texto.strip() or OI_TEXTO_PADRAO)
+    return _redir_leads("Mensagem do oi salva")
+
 
 # ============================================================
 # WEBHOOK Z-API (WhatsApp)
