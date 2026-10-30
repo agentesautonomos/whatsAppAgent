@@ -641,6 +641,14 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
     prompt_base = prompt_base.replace("{STATUS}", status_usuario)
     prompt_base = prompt_base.replace("[LINK_PAGAMENTO]", link_pg)
 
+    # {CONSUMO}: quanto esta conversa ja custou (ate a mensagem anterior)
+    tk_user = obter_tokens(telefone)
+    if tk_user["total"] > 0:
+        consumo_txt = f"{fmt_brl(tk_user['custo_brl'])} ({fmt_tokens(tk_user['total'])} tokens)"
+    else:
+        consumo_txt = "menos de 1 centavo"
+    prompt_base = prompt_base.replace("{CONSUMO}", consumo_txt)
+
     # Nicho: descobre uma vez, guarda, e carrega SOMENTE o arquivo desse nicho
     nicho = obter_nicho(telefone)
     if not nicho:
@@ -1704,7 +1712,8 @@ def editar_prompt_get(admin: str = Depends(verificar_admin), salvo: str = ""):
         <h2>Editar Prompt do Agente</h2>
         <p style="font-size:13px;color:#888;margin-bottom:16px;">
             Use <code>{{STATUS}}</code> para injetar FREEMIUM ou PREMIUM dinamicamente.<br>
-            Use <code>[LINK_PAGAMENTO]</code> para injetar o link de assinatura.
+            Use <code>[LINK_PAGAMENTO]</code> para injetar o link de assinatura.<br>
+            Use <code>{{CONSUMO}}</code> para injetar o custo ja acumulado da conversa do usuario (em R$).
         </p>
         <form method="post" action="/admin/prompt">
             <textarea name="prompt">{prompt_atual}</textarea>
