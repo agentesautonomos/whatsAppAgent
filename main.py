@@ -417,6 +417,7 @@ from urllib.parse import quote
 LEAD_PREFIX         = "lead:"
 CONTATO_PEND_PREFIX = "contato_pendente:"
 DEMORA_PREFIX       = "demora:"
+LEAD_INFO_PREFIX    = "lead_info:"
 OI_TEXTO_KEY        = "config:oi_texto"
 OI_TEXTO_PADRAO     = "Oi! 👋"
 DEMORA_LIMITE_MIN   = float(os.environ.get("DEMORA_LIMITE_MIN", "5"))
@@ -474,27 +475,94 @@ def listar_leads() -> list:
     return sorted(leads, key=lambda l: l.get("importado_em", ""))
 
 
+def _sem_acento(t: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFD", t or "")
+    return "".join(c for c in t if unicodedata.category(c) != "Mn").lower()
+
+
 def importar_leads(texto: str) -> dict:
-    """Cada linha: 'numero' ou 'nome numero' (qualquer ordem/separador)."""
+    """Cada linha aceita:
+       numero
+       nome numero
+       nome ; numero ; nicho      (separadores: ; | , ou tab; numero pode vir em qualquer posicao)"""
     res = {"importados": 0, "duplicados": 0, "invalidos": 0}
     for linha in (texto or "").splitlines():
         linha = linha.strip()
         if not linha:
             continue
-        m = re.search(r"\+?\(?\d[\d\s().\-]{8,}\d", linha)
-        tel = normalizar_telefone(m.group(0)) if m else None
+        nome, nicho_txt, tel = "", "", None
+        if re.search(r"[;|\t,]", linha):
+            campos = [c.strip() for c in re.split(r"[;|\t,]", linha) if c.strip()]
+            outros = []
+            for c in campos:
+                if tel is None and re.fullmatch(r"\+?\(?\d[\d\s().\-]{8,}\d", c):
+                    tel = normalizar_telefone(c)
+                else:
+                    outros.append(c)
+            if tel:
+                nome = outros[0] if outros else ""
+                nicho_txt = outros[1] if len(outros) > 1 else ""
+        else:
+            m = re.search(r"\+?\(?\d[\d\s().\-]{8,}\d", linha)
+            tel = normalizar_telefone(m.group(0)) if m else None
+            if tel:
+                nome = (linha[:m.start()] + " " + linha[m.end():]).strip(" ,;:|-\t()")
         if not tel:
             res["invalidos"] += 1
             continue
-        nome = (linha[:m.start()] + " " + linha[m.end():]).strip(" ,;:|-\t()")
         ja_usuario = any(r.get(f"historico:{v}") for v in variantes_telefone(tel))
         if obter_lead(tel) or ja_usuario:
             res["duplicados"] += 1
             continue
-        salvar_lead({"telefone": tel, "nome": nome[:80], "status": "pendente",
-                     "importado_em": datetime.now().isoformat()})
+        salvar_lead({"telefone": tel, "nome": nome[:80], "nicho_texto": nicho_txt[:60],
+                     "status": "pendente", "importado_em": datetime.now().isoformat()})
         res["importados"] += 1
     return res
+
+
+def nicho_lead_badge(lead: dict) -> str:
+    n = (lead.get("nicho_texto") or "").strip()
+    return f' <span class="badge badge-ativo">{esc(n)}</span>' if n else ""
+
+
+def montar_oi_texto(lead: dict) -> str:
+    """Troca {nome} pelo nome do lead (ou tira o marcador se nao houver nome)."""
+    texto = obter_oi_texto()
+    nome = (lead.get("nome") or "").strip()
+    texto = texto.replace("{nome}", nome)
+    texto = re.sub(r"[ \t]{2,}", " ", texto)
+    texto = re.sub(r"\s+([!,.?])", r"\1", texto)
+    return texto.strip()
+
+
+def obter_lead_info(tel: str) -> dict:
+    try:
+        return json.loads(r.get(f"{LEAD_INFO_PREFIX}{tel}") or "{}")
+    except Exception:
+        return {}
+
+
+def resolver_nicho_texto(telefone: str, texto: str) -> str | None:
+    """Converte o nicho digitado na importacao (ex: 'dentista') no arquivo de nicho."""
+    nichos = listar_nichos_disponiveis()
+    if not nichos or not (texto or "").strip():
+        return None
+    alvo = re.sub(r"[^a-z0-9]+", " ", _sem_acento(texto)).strip()
+    for nome in nichos:
+        base = nome[len(NICHO_ARQUIVO_PREFIX):]
+        base_txt = re.sub(r"[^a-z0-9]+", " ", _sem_acento(base)).strip()
+        if alvo == base_txt:
+            return nome
+    achados = [n for n in nichos
+               if alvo and alvo in re.sub(r"[^a-z0-9]+", " ", _sem_acento(n[len(NICHO_ARQUIVO_PREFIX):]))]
+    if len(achados) == 1:
+        return achados[0]
+    try:
+        return classificar_nicho(telefone, texto)
+    except Exception as e:
+        print(f"ERRO ao classificar nicho do lead: {e}")
+        return None
 
 
 def fmt_duracao(seg) -> str:
@@ -510,18 +578,22 @@ def fmt_duracao(seg) -> str:
 
 def processar_retorno_lead(telefone: str):
     """Chamada quando chega mensagem: se o numero era um lead, ele vira usuario.
-    Se ja tinha recebido o 'oi', mede a demora da resposta (so no 1o contato)."""
+    Guarda nome e nicho da importacao e mede a demora da resposta ao 'oi' (so no 1o contato)."""
     lead = obter_lead(telefone)
     if not lead:
         return
     apagar_lead(telefone)
+    info = {"nome": lead.get("nome", ""), "nicho_texto": lead.get("nicho_texto", "")}
+    r.set(f"{LEAD_INFO_PREFIX}{telefone}", json.dumps(info))
+    pend = dict(info)
     if lead.get("status") == "enviado" and lead.get("enviado_em"):
         try:
             seg = int((datetime.now() - datetime.fromisoformat(lead["enviado_em"])).total_seconds())
+            pend["demora_seg"] = seg
+            r.set(f"{DEMORA_PREFIX}{telefone}", str(seg))
         except Exception:
-            return
-        r.set(f"{DEMORA_PREFIX}{telefone}", str(seg))
-        r.set(f"{CONTATO_PEND_PREFIX}{telefone}", json.dumps({"demora_seg": seg}))
+            pass
+    r.set(f"{CONTATO_PEND_PREFIX}{telefone}", json.dumps(pend))
 
 
 def bloco_primeiro_contato(telefone: str) -> str:
@@ -529,27 +601,37 @@ def bloco_primeiro_contato(telefone: str) -> str:
     if not dados:
         return ""
     try:
-        seg = int(json.loads(dados).get("demora_seg", 0))
+        pend = json.loads(dados)
     except Exception:
         return ""
-    if seg > DEMORA_LIMITE_MIN * 60:
-        tempo = fmt_duracao(seg)
-        return (
-            "\n\n=== PRIMEIRO CONTATO (VOCE INICIOU A CONVERSA) ===\n"
-            f"Voce, o AgenteLab, mandou um 'oi' primeiro para esta pessoa e ela acabou de responder, {tempo} depois.\n"
-            "Comece sua resposta com UMA frase curta, leve e sem acusar, comentando essa demora e ligando ao dia a dia "
-            "do profissional: quando um cliente dele manda mensagem e demora esse tempo para ser respondido, ele pode "
-            f"procurar outro profissional. Use o tempo exato ({tempo}). Use sempre a palavra 'cliente'.\n"
-            "Em seguida, na mesma mensagem, apresente-se e pergunte a area de atuacao (ETAPA 1). Maximo 5 linhas.\n"
-            "Isso vale SO nesta primeira resposta: depois nao volte a falar da demora.\n"
-            "=== FIM DO PRIMEIRO CONTATO ===\n"
-        )
-    return (
-        "\n\n=== PRIMEIRO CONTATO (VOCE INICIOU A CONVERSA) ===\n"
-        "Voce mandou um 'oi' primeiro para esta pessoa e ela respondeu rapido. "
-        "NAO comente sobre demora. Siga a ETAPA 1 normalmente.\n"
-        "=== FIM DO PRIMEIRO CONTATO ===\n"
-    )
+    nome = (pend.get("nome") or "").strip()
+    seg = pend.get("demora_seg")
+    nicho = obter_nicho(telefone)
+    linhas = ["\n\n=== PRIMEIRO CONTATO (VOCE INICIOU A CONVERSA) ==="]
+    if seg is not None:
+        if int(seg) > DEMORA_LIMITE_MIN * 60:
+            tempo = fmt_duracao(seg)
+            linhas.append(
+                f"Voce, o AgenteLab, mandou um 'oi' primeiro para esta pessoa e ela respondeu {tempo} depois. "
+                "Comece sua resposta com UMA frase curta, leve e sem acusar, comentando essa demora e ligando ao dia a dia "
+                "do profissional: quando um cliente dele manda mensagem e demora esse tempo para ser respondido, ele pode "
+                f"procurar outro profissional. Use o tempo exato ({tempo}). Use sempre a palavra 'cliente'.")
+        else:
+            linhas.append("Voce mandou um 'oi' primeiro e ela respondeu rapido. NAO comente sobre demora.")
+    if nome:
+        linhas.append(f"O nome da pessoa e '{nome}'. Chame-a por esse nome (do jeito que foi informado, ex: Dr. ou Dra. se constar).")
+    if nicho:
+        area = nicho[len(NICHO_ARQUIVO_PREFIX):].replace("_", " ") if nicho.startswith(NICHO_ARQUIVO_PREFIX) else nicho
+        linhas.append(
+            f"Voce JA SABE a area dela ({area}): NAO pergunte a area. Nesta primeira resposta, em uma unica mensagem: "
+            "(1) a frase sobre a demora, se houver; (2) chame pelo nome, se souber; (3) apresente-se em 1 frase como AgenteLab, "
+            "que cria assistentes de WhatsApp; (4) emende a MENSAGEM 1 do SCRIPT DO NICHO ATUAL (que avisa da simulacao e ja "
+            "comeca o atendimento). Maximo 6 linhas.")
+    else:
+        linhas.append("Em seguida, na mesma mensagem, apresente-se e pergunte a area de atuacao (ETAPA 1). Maximo 5 linhas.")
+    linhas.append("Isso vale SO nesta primeira resposta: depois nao volte a falar da demora nem se reapresente.")
+    linhas.append("=== FIM DO PRIMEIRO CONTATO ===\n")
+    return "\n".join(linhas)
 
 
 # ============================================================
@@ -804,11 +886,15 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
     # Nicho: descobre uma vez, guarda, e carrega SOMENTE o arquivo desse nicho
     nicho = obter_nicho(telefone)
     if not nicho:
-        try:
-            nicho = classificar_nicho(telefone, mensagem_usuario)
-        except Exception as e:
-            print(f"ERRO ao classificar nicho: {e}")
-            nicho = None
+        _info = obter_lead_info(telefone)
+        if _info.get("nicho_texto"):
+            nicho = resolver_nicho_texto(telefone, _info["nicho_texto"])
+        if not nicho:
+            try:
+                nicho = classificar_nicho(telefone, mensagem_usuario)
+            except Exception as e:
+                print(f"ERRO ao classificar nicho: {e}")
+                nicho = None
         if nicho:
             salvar_nicho(telefone, nicho)
             print(f"NICHO de {telefone}: {nicho}")
@@ -1687,6 +1773,7 @@ def apagar_historico(telefone: str, admin: str = Depends(verificar_admin)):
         r.delete(f"{NICHO_PREFIX}{tel}")
         r.delete(f"{CONTATO_PEND_PREFIX}{tel}")
         r.delete(f"{DEMORA_PREFIX}{tel}")
+        r.delete(f"{LEAD_INFO_PREFIX}{tel}")
         r.delete(f"{TOKENS_PREFIX}{tel}")
         r.delete(f"{CONSULTA_PREFIX}{tel}")
         r.delete(f"{LEAD_PREFIX}{tel}")
@@ -2024,7 +2111,7 @@ def painel_leads(admin: str = Depends(verificar_admin), msg: str = ""):
         nome = esc(l.get("nome") or "(sem nome)")
         rows_pend += f"""
         <div class="aluno-row">
-            <div><strong>{nome}</strong> <span class="badge badge-freemium">{tel}</span></div>
+            <div><strong>{nome}</strong> <span class="badge badge-freemium">{tel}</span>{nicho_lead_badge(l)}</div>
             <div style="display:flex;gap:6px">
                 <form method="post" action="/admin/leads/oi/{tel}"><button type="submit" class="btn btn-primary">👋 Oi</button></form>
                 <form method="post" action="/admin/leads/remover/{tel}" onsubmit="return confirm('Remover este lead?')"><button type="submit" class="btn btn-danger">Remover</button></form>
@@ -2044,7 +2131,7 @@ def painel_leads(admin: str = Depends(verificar_admin), msg: str = ""):
         rows_env += f"""
         <div class="aluno-row">
             <div>
-                <div><strong>{nome}</strong> <span class="badge badge-freemium">{tel}</span> <span class="badge badge-pendente">aguardando resposta</span></div>
+                <div><strong>{nome}</strong> <span class="badge badge-freemium">{tel}</span> <span class="badge badge-pendente">aguardando resposta</span>{nicho_lead_badge(l)}</div>
                 <div class="aluno-info">oi enviado ha {ha}</div>
             </div>
             <form method="post" action="/admin/leads/remover/{tel}" onsubmit="return confirm('Remover este lead?')"><button type="submit" class="btn btn-danger">Remover</button></form>
@@ -2062,11 +2149,13 @@ def painel_leads(admin: str = Depends(verificar_admin), msg: str = ""):
     <div class="card">
         <h2>Importar leads</h2>
         <p style="font-size:13px;color:#888;margin-bottom:12px;">
-            Cole uma lista, um por linha: so o numero, ou nome e numero (ex: <code>Dr Joao 11 99999-8888</code>).
+            Cole uma lista, um por linha. Formato completo: <code>nome ; numero ; nicho</code>
+            (ex: <code>Dr Joao ; 11 99999-8888 ; dentista</code>). Tambem vale so o numero, ou nome e numero.
+            Com o nicho informado, o bot ja entra na demo daquela area e chama a pessoa pelo nome.
             Numeros ja importados ou que ja conversaram sao ignorados.
         </p>
         <form method="post" action="/admin/leads/importar">
-            <textarea name="texto" style="min-height:130px" placeholder="Dr Joao 11 99999-8888&#10;(51) 98888-7777&#10;5511977776666"></textarea>
+            <textarea name="texto" style="min-height:130px" placeholder="Dr Joao ; 11 99999-8888 ; dentista&#10;Ana ; (51) 98888-7777 ; nutricionista&#10;5511977776666"></textarea>
             <br><br>
             <button type="submit" class="btn btn-primary">Importar</button>
         </form>
@@ -2074,6 +2163,7 @@ def painel_leads(admin: str = Depends(verificar_admin), msg: str = ""):
 
     <div class="card">
         <h2>Mensagem do "Oi"</h2>
+        <p style="font-size:13px;color:#888;margin-bottom:10px;">Use <code>{{nome}}</code> para incluir o nome do lead (ex: <code>Oi {{nome}}! 👋</code>). Sem nome, o marcador some.</p>
         <form method="post" action="/admin/leads/texto" style="display:flex;gap:10px;align-items:center">
             <input type="text" name="oi_texto" value="{esc(obter_oi_texto())}">
             <button type="submit" class="btn btn-primary">Salvar</button>
@@ -2104,7 +2194,7 @@ async def leads_oi(tel: str, admin: str = Depends(verificar_admin)):
     lead = obter_lead(tel)
     if not lead or lead.get("status") == "enviado":
         return _redir_leads("Lead nao encontrado ou o oi ja foi enviado")
-    ok = await enviar_whatsapp(lead["telefone"], obter_oi_texto())
+    ok = await enviar_whatsapp(lead["telefone"], montar_oi_texto(lead))
     if not ok:
         return _redir_leads("Nao consegui enviar. Confira as variaveis da Z-API no Railway e se o WhatsApp esta conectado.")
     lead["status"]     = "enviado"
