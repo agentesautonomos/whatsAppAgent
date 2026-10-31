@@ -1613,8 +1613,8 @@ def painel_admin(admin: str = Depends(verificar_admin)):
                 <div class="aluno-info">{tokens_txt}</div>
                 <div class="aluno-info">{ultima}</div>
             </div>
-            <a href="/admin/apagar/{telefone}" onclick="return confirm('Apagar historico de {telefone}?')">
-                <span class="btn btn-danger">Apagar</span>
+            <a href="/admin/apagar/{telefone}" onclick="return confirm('Zerar tudo de {telefone}? Apaga conversa, nicho e consumo. O proximo oi sera como a primeira vez.')">
+                <span class="btn btn-danger">Zerar</span>
             </a>
         </div>"""
 
@@ -1680,9 +1680,16 @@ def ver_conversa(telefone: str, admin: str = Depends(verificar_admin)):
 
 @app.get("/admin/apagar/{telefone}")
 def apagar_historico(telefone: str, admin: str = Depends(verificar_admin)):
-    r.delete(f"historico:{telefone}")
-    r.delete(f"{NICHO_PREFIX}{telefone}")
-    r.delete(f"{CONTATO_PEND_PREFIX}{telefone}")
+    """Zera o numero por completo: o proximo contato e como se fosse a primeira vez.
+    (O total geral de tokens do painel nao e alterado: ele representa o gasto real.)"""
+    for tel in variantes_telefone(telefone) | {telefone}:
+        r.delete(f"historico:{tel}")
+        r.delete(f"{NICHO_PREFIX}{tel}")
+        r.delete(f"{CONTATO_PEND_PREFIX}{tel}")
+        r.delete(f"{DEMORA_PREFIX}{tel}")
+        r.delete(f"{TOKENS_PREFIX}{tel}")
+        r.delete(f"{CONSULTA_PREFIX}{tel}")
+        r.delete(f"{LEAD_PREFIX}{tel}")
     return RedirectResponse(url="/admin")
 
 # ============================================================
