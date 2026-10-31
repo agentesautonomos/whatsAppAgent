@@ -1894,9 +1894,13 @@ async def editar_prompt_post(
 # ============================================================
 
 @app.get("/admin/arquivos", response_class=HTMLResponse)
-async def painel_arquivos(admin: str = Depends(verificar_admin), salvo: str = ""):
+async def painel_arquivos(admin: str = Depends(verificar_admin), salvo: str = "", msg: str = ""):
     arquivos = listar_arquivos()
-    aviso = '<div class="success">Arquivo salvo com sucesso!</div>' if salvo == "1" else ""
+    aviso = ""
+    if msg:
+        aviso = f'<div class="success">{esc(msg)}</div>'
+    elif salvo == "1":
+        aviso = '<div class="success">Arquivo salvo com sucesso!</div>'
 
     rows = ""
     for arq in arquivos:
@@ -1926,49 +1930,62 @@ async def painel_arquivos(admin: str = Depends(verificar_admin), salvo: str = ""
         {rows}
     </div>
     <div class="card">
-        <h2>Novo Arquivo</h2>
+        <h2>Enviar Arquivos</h2>
+        <p style="font-size:13px;color:#888;margin-bottom:12px;">
+            Selecione quantos arquivos quiser (PDF, TXT ou MD). O nome de cada um vira o nome de referencia:
+            <code>nicho_dentista.txt</code> vira <code>[nicho_dentista]</code>. Se ja existir um com o mesmo nome, ele e substituido.
+        </p>
         <form method="post" action="/admin/arquivos" enctype="multipart/form-data">
-            <div style="margin-bottom:12px;">
-                <label style="font-size:13px;color:#555;display:block;margin-bottom:6px;">Nome de referencia (sem espacos)</label>
-                <input type="text" name="nome" required placeholder="metodologia" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;">
-            </div>
             <div style="margin-bottom:16px;">
-                <label style="font-size:13px;color:#555;display:block;margin-bottom:6px;">Arquivo (PDF ou TXT — max 500KB)</label>
-                <input type="file" name="arquivo" accept=".pdf,.txt,.md" required style="font-size:14px;">
+                <input type="file" name="arquivos" accept=".pdf,.txt,.md" multiple required style="font-size:14px;">
             </div>
-            <button type="submit" class="btn btn-primary">Salvar Arquivo</button>
+            <button type="submit" class="btn btn-primary">Enviar todos</button>
         </form>
     </div>"""
 
     return HTMLResponse(base_html("Arquivos", conteudo, "arquivos"))
 
 
-@app.post("/admin/arquivos")
-async def upload_arquivo(
-    nome: str = Form(...),
-    arquivo: UploadFile = File(...),
-    admin: str = Depends(verificar_admin)
-):
-    conteudo_bytes = await arquivo.read()
-    filename = arquivo.filename.lower()
-
-    if filename.endswith(".pdf"):
+def _extrair_texto_arquivo(filename: str, conteudo_bytes: bytes) -> str:
+    if filename.lower().endswith(".pdf"):
         try:
             import pdfplumber
             with pdfplumber.open(io.BytesIO(conteudo_bytes)) as pdf:
                 paginas = [p.extract_text() for p in pdf.pages[:30] if p.extract_text()]
-            texto_final = "\n\n".join(paginas)
+            return "\n\n".join(paginas)
         except Exception as e:
-            texto_final = f"[Erro ao ler PDF: {e}]"
-    else:
-        try:
-            texto_final = conteudo_bytes.decode("utf-8")
-        except Exception:
-            texto_final = conteudo_bytes.decode("latin-1", errors="ignore")
+            return f"[Erro ao ler PDF: {e}]"
+    try:
+        return conteudo_bytes.decode("utf-8")
+    except Exception:
+        return conteudo_bytes.decode("latin-1", errors="ignore")
 
-    nome_seguro = re.sub(r"[^a-zA-Z0-9_\-]", "", nome).lower() or "arquivo"
-    salvar_arquivo(nome_seguro, texto_final)
-    return RedirectResponse(url="/admin/arquivos?salvo=1", status_code=303)
+
+@app.post("/admin/arquivos")
+async def upload_arquivo(
+    arquivos: list[UploadFile] = File(...),
+    admin: str = Depends(verificar_admin)
+):
+    novos, substituidos, vazios = 0, 0, 0
+    for arq in arquivos:
+        if not arq.filename:
+            continue
+        conteudo_bytes = await arq.read()
+        texto = _extrair_texto_arquivo(arq.filename, conteudo_bytes)
+        if not texto.strip():
+            vazios += 1
+            continue
+        base = arq.filename.rsplit(".", 1)[0] if "." in arq.filename else arq.filename
+        nome_seguro = re.sub(r"[^a-zA-Z0-9_\-]", "", base).lower() or "arquivo"
+        if obter_arquivo(nome_seguro) is not None:
+            substituidos += 1
+        else:
+            novos += 1
+        salvar_arquivo(nome_seguro, texto)
+    partes = [f"{novos} novo(s)", f"{substituidos} substituido(s)"]
+    if vazios:
+        partes.append(f"{vazios} vazio(s) ignorado(s)")
+    return RedirectResponse(url="/admin/arquivos?msg=" + quote("Enviados: " + ", ".join(partes)), status_code=303)
 
 
 @app.get("/admin/arquivos/apagar/{nome}")
