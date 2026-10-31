@@ -596,6 +596,19 @@ def processar_retorno_lead(telefone: str):
     r.set(f"{CONTATO_PEND_PREFIX}{telefone}", json.dumps(pend))
 
 
+def bloco_area_livre(telefone: str, nicho) -> str:
+    """Lead com area informada na importacao mas sem arquivo de nicho: improvisa sem perguntar a area."""
+    if nicho:
+        return ""
+    info = obter_lead_info(telefone)
+    area = (info.get("nicho_texto") or "").strip()
+    if not area or not info.get("sem_script"):
+        return ""
+    return (f"\n\n=== AREA DA PESSOA (SEM SCRIPT PRONTO) ===\n"
+            f"A area dela e: {area}. NAO pergunte a area. Conduza a simulacao improvisada da ETAPA 3, item B, "
+            "e depois a ETAPA 4 completa.\n=== FIM ===\n")
+
+
 def bloco_primeiro_contato(telefone: str) -> str:
     dados = r.get(f"{CONTATO_PEND_PREFIX}{telefone}")
     if not dados:
@@ -627,6 +640,11 @@ def bloco_primeiro_contato(telefone: str) -> str:
             "(1) a frase sobre a demora, se houver; (2) chame pelo nome, se souber; (3) apresente-se em 1 frase como AgenteLab, "
             "que cria assistentes de WhatsApp; (4) emende a MENSAGEM 1 do SCRIPT DO NICHO ATUAL (que avisa da simulacao e ja "
             "comeca o atendimento). Maximo 6 linhas.")
+    elif (pend.get("nicho_texto") or "").strip():
+        linhas.append(
+            f"Voce JA SABE a area dela: {pend['nicho_texto']} (nao ha script pronto). NAO pergunte a area. "
+            "Nesta primeira resposta, em uma unica mensagem: (1) a frase sobre a demora, se houver; (2) chame pelo nome, se souber; "
+            "(3) apresente-se em 1 frase como AgenteLab; (4) emende a MENSAGEM 1 da simulacao improvisada (ETAPA 3, item B). Maximo 6 linhas.")
     else:
         linhas.append("Em seguida, na mesma mensagem, apresente-se e pergunte a area de atuacao (ETAPA 1). Maximo 5 linhas.")
     linhas.append("Isso vale SO nesta primeira resposta: depois nao volte a falar da demora nem se reapresente.")
@@ -885,11 +903,14 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
 
     # Nicho: descobre uma vez, guarda, e carrega SOMENTE o arquivo desse nicho
     nicho = obter_nicho(telefone)
+    _info = obter_lead_info(telefone)
     if not nicho:
-        _info = obter_lead_info(telefone)
-        if _info.get("nicho_texto"):
+        if _info.get("nicho_texto") and not _info.get("sem_script"):
             nicho = resolver_nicho_texto(telefone, _info["nicho_texto"])
-        if not nicho:
+            if not nicho:
+                _info["sem_script"] = True
+                r.set(f"{LEAD_INFO_PREFIX}{telefone}", json.dumps(_info))
+        if not nicho and not _info.get("sem_script"):
             try:
                 nicho = classificar_nicho(telefone, mensagem_usuario)
             except Exception as e:
@@ -906,7 +927,7 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
             bloco_nicho = (f"\n\n=== SCRIPT DO NICHO ATUAL ({nicho}) — siga este script ===\n"
                            f"{conteudo_nicho}\n=== FIM DO SCRIPT DO NICHO ===\n")
 
-    bloco_contato = bloco_primeiro_contato(telefone)
+    bloco_contato = bloco_primeiro_contato(telefone) + bloco_area_livre(telefone, nicho)
     system = prompt_base + bloco_nicho + bloco_contato + f"\n\nDATA ATUAL: {dia_semana}, {hoje}\nSTATUS DO USUARIO: {status_usuario}\nLINK DE PAGAMENTO: {link_pg}"
 
     resposta = client.messages.create(
