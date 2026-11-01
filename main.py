@@ -2251,7 +2251,7 @@ async def leads_texto(oi_texto: str = Form(""), admin: str = Depends(verificar_a
 # ============================================================
 # AGRUPAR MENSAGENS SEGUIDAS (espera alguns segundos e responde uma vez so)
 # ============================================================
-DEBOUNCE_SEGUNDOS = float(os.environ.get("DEBOUNCE_SEGUNDOS", "22"))
+DEBOUNCE_SEGUNDOS = float(os.environ.get("DEBOUNCE_SEGUNDOS", "12"))
 FILA_PREFIX       = "fila:"
 FILA_SEQ_PREFIX   = "fila_seq:"
 _locks_conversa: dict = {}
