@@ -607,6 +607,23 @@ def processar_retorno_lead(telefone: str):
     r.set(f"{CONTATO_PEND_PREFIX}{telefone}", json.dumps(pend))
 
 
+def frase_demora(telefone: str) -> str:
+    """Frase fixa sobre a demora, escrita pelo sistema (nao depende do modelo lembrar).
+    Vazia se nao houve Oi ou se a pessoa respondeu dentro do limite."""
+    dados = r.get(f"{CONTATO_PEND_PREFIX}{telefone}")
+    if not dados:
+        return ""
+    try:
+        seg = json.loads(dados).get("demora_seg")
+        if seg is None or int(seg) <= DEMORA_LIMITE_MIN * 60:
+            return ""
+        tempo = fmt_duracao(seg)
+    except Exception:
+        return ""
+    return (f"Repara so: voce levou {tempo} pra me responder. "
+            "Se fosse um cliente seu esperando esse tempo no WhatsApp, ele ja poderia ter procurado outro profissional 😅")
+
+
 def bloco_area_livre(telefone: str, nicho) -> str:
     """Lead com area informada na importacao mas sem arquivo de nicho: improvisa sem perguntar a area."""
     if nicho:
@@ -634,12 +651,10 @@ def bloco_primeiro_contato(telefone: str) -> str:
     linhas = ["\n\n=== PRIMEIRO CONTATO (VOCE INICIOU A CONVERSA) ==="]
     if seg is not None:
         if int(seg) > DEMORA_LIMITE_MIN * 60:
-            tempo = fmt_duracao(seg)
             linhas.append(
-                f"Voce, o AgenteLab, mandou um 'oi' primeiro para esta pessoa e ela respondeu {tempo} depois. "
-                "Comece sua resposta com UMA frase curta, leve e sem acusar, comentando essa demora e ligando ao dia a dia "
-                "do profissional: quando um cliente dele manda mensagem e demora esse tempo para ser respondido, ele pode "
-                f"procurar outro profissional. Use o tempo exato ({tempo}). Use sempre a palavra 'cliente'.")
+                "Voce mandou um 'oi' primeiro e a pessoa demorou para responder. O SISTEMA ja escreve, antes da sua mensagem, "
+                "uma frase sobre essa demora. NAO comente a demora, NAO repita essa ideia e NAO escreva nada sobre tempo de resposta: "
+                "comece direto pela saudacao com o nome e siga as instrucoes abaixo.")
         else:
             linhas.append("Voce mandou um 'oi' primeiro e ela respondeu rapido. NAO comente sobre demora.")
     if nome:
@@ -939,6 +954,7 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
             bloco_nicho = (f"\n\n=== SCRIPT DO NICHO ATUAL ({nicho}) — siga este script ===\n"
                            f"{conteudo_nicho}\n=== FIM DO SCRIPT DO NICHO ===\n")
 
+    prefixo_demora = frase_demora(telefone)
     bloco_contato = bloco_primeiro_contato(telefone) + bloco_area_livre(telefone, nicho)
     system = prompt_base + bloco_nicho + bloco_contato + f"\n\nDATA ATUAL: {dia_semana}, {hoje}\nSTATUS DO USUARIO: {status_usuario}\nLINK DE PAGAMENTO: {link_pg}"
 
@@ -952,6 +968,8 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
     r.delete(f"{CONTATO_PEND_PREFIX}{telefone}")
 
     texto_resposta = resposta.content[0].text
+    if prefixo_demora:
+        texto_resposta = prefixo_demora + "\n\n" + texto_resposta
     salvar_mensagem(telefone, "assistant", texto_resposta)
 
     # Detecta se o bot mencionou interesse em consulta na resposta
