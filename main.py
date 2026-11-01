@@ -424,6 +424,16 @@ OI_TEXTO_PADRAO     = "Oi! 👋"
 DEMORA_LIMITE_MIN   = float(os.environ.get("DEMORA_LIMITE_MIN", "5"))
 
 
+def agora_brasilia() -> datetime:
+    """Data e hora de Brasilia (o servidor roda em UTC)."""
+    from datetime import timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Sao_Paulo"))
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=-3)))
+
+
 def obter_oi_texto() -> str:
     return r.get(OI_TEXTO_KEY) or OI_TEXTO_PADRAO
 
@@ -882,9 +892,10 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
     salvar_mensagem(telefone, "user", mensagem_usuario)
     historico = obter_historico(telefone)
 
-    hoje       = datetime.now().strftime("%d/%m/%Y")
+    _agora_br  = agora_brasilia()
+    hoje       = _agora_br.strftime("%d/%m/%Y") + " " + _agora_br.strftime("%H:%M") + " (horario de Brasilia)"
     dia_semana = ["segunda-feira","terca-feira","quarta-feira","quinta-feira",
-                  "sexta-feira","sabado","domingo"][datetime.now().weekday()]
+                  "sexta-feira","sabado","domingo"][_agora_br.weekday()]
 
     # Injeta status de assinatura no prompt
     status_usuario = "PREMIUM" if eh_premium(telefone) else "FREEMIUM"
