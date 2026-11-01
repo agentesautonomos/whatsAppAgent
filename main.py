@@ -607,6 +607,45 @@ def processar_retorno_lead(telefone: str):
     r.set(f"{CONTATO_PEND_PREFIX}{telefone}", json.dumps(pend))
 
 
+SEP_MSG          = "\n\n<<<MSG>>>\n\n"   # separa mensagens que saem separadas no WhatsApp
+PITCH_KEY        = "config:pitch_final"
+PITCH_ENVIADO    = "pitch_enviado:"
+PITCH_PADRAO = (
+    "Viu só o que o seu assistente pode fazer pelos seus clientes? 😄 E isso é só o começo — ele faz muito mais:\n\n"
+    "✅ Atende 24h, inclusive à noite, fins de semana e feriados\n"
+    "✅ Responde horários, endereço e dúvidas na hora\n"
+    "✅ Qualifica o contato antes de chegar até você\n"
+    "✅ Agenda direto pelo WhatsApp\n"
+    "✅ Guarda o histórico de cada conversa num painel simples\n\n"
+    "E o melhor: sem mensalidade pelo uso da IA, você paga só o que consumir. "
+    "Pra ter ideia, essa nossa conversa custou cerca de {CONSUMO}.\n\n"
+    "Quer receber uma proposta? É só me passar seu nome e o melhor horário pra conversar 📲"
+)
+
+
+def obter_pitch() -> str:
+    return r.get(PITCH_KEY) or PITCH_PADRAO
+
+
+def consumo_texto(telefone: str) -> str:
+    tk = obter_tokens(telefone)
+    if tk["total"] > 0:
+        return f"{fmt_brl(tk['custo_brl'])} ({fmt_tokens(tk['total'])} tokens)"
+    return "menos de 1 centavo"
+
+
+def pitch_final_se_acabou(telefone: str, resposta_bot: str) -> str:
+    """Se a resposta do bot encerra a simulacao ('fim da simulacao'), devolve a mensagem de venda
+    escrita pelo sistema (com o custo real). Vazio se nao acabou, se ja foi enviada ou se o bot ja fez o pitch."""
+    norm = _sem_acento(resposta_bot)
+    if "fim da simulacao" not in norm:
+        return ""
+    if "sem mensalidade" in norm or r.get(f"{PITCH_ENVIADO}{telefone}"):
+        return ""
+    r.set(f"{PITCH_ENVIADO}{telefone}", "1")
+    return obter_pitch().replace("{CONSUMO}", consumo_texto(telefone))
+
+
 def frase_demora(telefone: str) -> str:
     """Frase fixa sobre a demora, escrita pelo sistema (nao depende do modelo lembrar).
     Vazia se nao houve Oi ou se a pessoa respondeu dentro do limite."""
@@ -620,8 +659,8 @@ def frase_demora(telefone: str) -> str:
         tempo = fmt_duracao(seg)
     except Exception:
         return ""
-    return (f"Repara so: voce levou {tempo} pra me responder. "
-            "Se fosse um cliente seu esperando esse tempo no WhatsApp, ele ja poderia ter procurado outro profissional 😅")
+    return (f"Repara só: você levou {tempo} pra me responder. "
+            "Se fosse um cliente seu esperando esse tempo no WhatsApp, ele já poderia ter procurado outro profissional 😅")
 
 
 def bloco_area_livre(telefone: str, nicho) -> str:
@@ -967,9 +1006,12 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
     registrar_tokens(telefone, resposta.usage)
     r.delete(f"{CONTATO_PEND_PREFIX}{telefone}")
 
-    texto_resposta = resposta.content[0].text
-    if prefixo_demora:
-        texto_resposta = prefixo_demora + "\n\n" + texto_resposta
+    texto_bot = resposta.content[0].text
+    partes = ([prefixo_demora] if prefixo_demora else []) + [texto_bot]
+    pitch = pitch_final_se_acabou(telefone, texto_bot)
+    if pitch:
+        partes.append(pitch)
+    texto_resposta = "\n\n".join(partes)          # o que fica no historico
     salvar_mensagem(telefone, "assistant", texto_resposta)
 
     # Detecta se o bot mencionou interesse em consulta na resposta
@@ -977,7 +1019,7 @@ async def chamar_claude(telefone: str, mensagem_usuario: str) -> str:
         # Tenta extrair nome da ultima mensagem do usuario
         registrar_interesse_consulta(telefone, mensagem_usuario[:50])
 
-    return texto_resposta
+    return SEP_MSG.join(partes)                    # o que sai no WhatsApp (mensagens separadas)
 
 # ============================================================
 # ROTAS PUBLICAS
@@ -1825,6 +1867,7 @@ def apagar_historico(telefone: str, admin: str = Depends(verificar_admin)):
         r.delete(f"{CONTATO_PEND_PREFIX}{tel}")
         r.delete(f"{DEMORA_PREFIX}{tel}")
         r.delete(f"{LEAD_INFO_PREFIX}{tel}")
+        r.delete(f"{PITCH_ENVIADO}{tel}")
         r.delete(f"{TOKENS_PREFIX}{tel}")
         r.delete(f"{CONSULTA_PREFIX}{tel}")
         r.delete(f"{LEAD_PREFIX}{tel}")
@@ -2222,6 +2265,16 @@ def painel_leads(admin: str = Depends(verificar_admin), msg: str = ""):
     </div>
 
     <div class="card">
+        <h2>Mensagem de venda (final da demo)</h2>
+        <p style="font-size:13px;color:#888;margin-bottom:10px;">Enviada automaticamente, em mensagem separada, assim que a simulacao termina. Use <code>{{CONSUMO}}</code> para o custo real da conversa.</p>
+        <form method="post" action="/admin/leads/pitch">
+            <textarea name="pitch" style="min-height:230px">{esc(obter_pitch())}</textarea>
+            <br><br>
+            <button type="submit" class="btn btn-primary">Salvar</button>
+        </form>
+    </div>
+
+    <div class="card">
         <h2>Pendentes ({len(pendentes)})</h2>
         {rows_pend}
     </div>
@@ -2258,6 +2311,12 @@ async def leads_oi(tel: str, admin: str = Depends(verificar_admin)):
 async def leads_remover(tel: str, admin: str = Depends(verificar_admin)):
     apagar_lead(tel)
     return _redir_leads("Lead removido")
+
+
+@app.post("/admin/leads/pitch")
+async def leads_pitch(pitch: str = Form(""), admin: str = Depends(verificar_admin)):
+    r.set(PITCH_KEY, pitch.strip() or PITCH_PADRAO)
+    return _redir_leads("Mensagem de venda salva")
 
 
 @app.post("/admin/leads/texto")
@@ -2310,7 +2369,10 @@ async def _responder_apos_espera(telefone: str, seq: int):
             if len(mensagens) > 1:
                 print(f"AGRUPADAS {len(mensagens)} mensagens de {telefone}")
             resposta = await chamar_claude(telefone, texto)
-            await enviar_whatsapp(telefone, resposta)
+            for i, parte in enumerate(p for p in resposta.split(SEP_MSG) if p.strip()):
+                if i:
+                    await asyncio.sleep(2)
+                await enviar_whatsapp(telefone, parte)
     except Exception as e:
         print(f"ERRO ao responder {telefone}: {e}")
 
