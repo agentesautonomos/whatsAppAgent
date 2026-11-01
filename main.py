@@ -1,5 +1,6 @@
 import os
 import io
+import asyncio
 import json
 import re
 import secrets
@@ -2237,6 +2238,55 @@ async def leads_texto(oi_texto: str = Form(""), admin: str = Depends(verificar_a
 
 
 # ============================================================
+# AGRUPAR MENSAGENS SEGUIDAS (espera alguns segundos e responde uma vez so)
+# ============================================================
+DEBOUNCE_SEGUNDOS = float(os.environ.get("DEBOUNCE_SEGUNDOS", "22"))
+FILA_PREFIX       = "fila:"
+FILA_SEQ_PREFIX   = "fila_seq:"
+_locks_conversa: dict = {}
+_tarefas_ativas: set = set()
+
+
+def _lock_conversa(telefone: str) -> asyncio.Lock:
+    if telefone not in _locks_conversa:
+        _locks_conversa[telefone] = asyncio.Lock()
+    return _locks_conversa[telefone]
+
+
+def agendar_resposta(telefone: str, texto: str):
+    """Poe a mensagem na fila e agenda a resposta. Se chegar outra antes do prazo,
+    o prazo recomeca e as mensagens sao juntadas numa resposta so."""
+    r.rpush(f"{FILA_PREFIX}{telefone}", texto)
+    r.expire(f"{FILA_PREFIX}{telefone}", 3600)
+    seq = r.incr(f"{FILA_SEQ_PREFIX}{telefone}")
+    r.expire(f"{FILA_SEQ_PREFIX}{telefone}", 3600)
+    tarefa = asyncio.create_task(_responder_apos_espera(telefone, int(seq)))
+    _tarefas_ativas.add(tarefa)
+    tarefa.add_done_callback(_tarefas_ativas.discard)
+
+
+async def _responder_apos_espera(telefone: str, seq: int):
+    try:
+        await asyncio.sleep(DEBOUNCE_SEGUNDOS)
+        if int(r.get(f"{FILA_SEQ_PREFIX}{telefone}") or 0) != seq:
+            return  # chegou mensagem mais nova: ela cuida da resposta
+        async with _lock_conversa(telefone):
+            pipe = r.pipeline()
+            pipe.lrange(f"{FILA_PREFIX}{telefone}", 0, -1)
+            pipe.delete(f"{FILA_PREFIX}{telefone}")
+            mensagens = pipe.execute()[0]
+            if not mensagens:
+                return
+            texto = "\n".join(mensagens)
+            if len(mensagens) > 1:
+                print(f"AGRUPADAS {len(mensagens)} mensagens de {telefone}")
+            resposta = await chamar_claude(telefone, texto)
+            await enviar_whatsapp(telefone, resposta)
+    except Exception as e:
+        print(f"ERRO ao responder {telefone}: {e}")
+
+
+# ============================================================
 # WEBHOOK Z-API (WhatsApp)
 # ============================================================
 
@@ -2258,8 +2308,7 @@ async def webhook(request: Request):
 
         texto_midia = await processar_midia(dados)
         if texto_midia:
-            resposta = await chamar_claude(telefone, texto_midia)
-            await enviar_whatsapp(telefone, resposta)
+            agendar_resposta(telefone, texto_midia)
             return {"status": "ok"}
 
         texto = dados.get("text", {}).get("message", "")
@@ -2267,8 +2316,7 @@ async def webhook(request: Request):
             return {"status": "ignorado"}
 
         print(f"MSG de {telefone}: {texto[:80]}")
-        resposta = await chamar_claude(telefone, texto)
-        await enviar_whatsapp(telefone, resposta)
+        agendar_resposta(telefone, texto)
         return {"status": "ok"}
 
     except Exception as e:
